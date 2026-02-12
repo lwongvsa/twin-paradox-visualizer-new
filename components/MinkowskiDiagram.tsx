@@ -1,0 +1,551 @@
+import React, { useEffect, useRef, useState } from 'react';
+import * as d3 from 'd3';
+import { SimulationParams, SimulationStep } from '../types';
+
+interface Props {
+  params: SimulationParams;
+  step: SimulationStep;
+  progress: number; // 0 to 1 representing progress within the step
+  showAliceGrid: boolean;
+  showBobSignals: boolean;
+  showAliceSignals: boolean;
+}
+
+const MinkowskiDiagram: React.FC<Props> = ({ params, step, progress, showAliceGrid, showBobSignals, showAliceSignals }) => {
+  const svgRef = useRef<SVGSVGElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [dimensions, setDimensions] = useState({ width: 600, height: 600 });
+  const [counts, setCounts] = useState({ bobReceivedByAlice: 0, aliceReceivedByBob: 0 });
+
+  // Physics Calculations
+  const v = params.velocity;
+  const dist = params.distance;
+  const gamma = 1 / Math.sqrt(1 - v * v);
+  const bobTimeOneWay = dist / v;
+  const aliceTimeOneWay = bobTimeOneWay / gamma;
+  const totalBobTime = bobTimeOneWay * 2;
+  
+  // Update dimensions on resize
+  useEffect(() => {
+    const updateDims = () => {
+      if (containerRef.current) {
+        setDimensions({
+          width: containerRef.current.clientWidth,
+          height: containerRef.current.clientHeight || 500
+        });
+      }
+    };
+    window.addEventListener('resize', updateDims);
+    updateDims();
+    return () => window.removeEventListener('resize', updateDims);
+  }, []);
+
+  useEffect(() => {
+    if (!svgRef.current) return;
+
+    const svg = d3.select(svgRef.current);
+    svg.selectAll("*").remove(); // Clear canvas
+
+    const margin = { top: 20, right: 30, bottom: 40, left: 50 };
+    const width = dimensions.width - margin.left - margin.right;
+    const height = dimensions.height - margin.top - margin.bottom;
+
+    // Define Clip Path
+    svg.append("defs").append("clipPath")
+       .attr("id", "chart-clip")
+       .append("rect")
+       .attr("width", width)
+       .attr("height", height);
+
+    const g = svg.append("g")
+      .attr("transform", `translate(${margin.left},${margin.top})`);
+
+    // Scales
+    // X axis: Distance (-1 to dist + 1)
+    const xScale = d3.scaleLinear()
+      .domain([-1, dist + 2])
+      .range([0, width]);
+
+    // Y axis: Time (-1 to totalBobTime + 2)
+    const yScale = d3.scaleLinear()
+      .domain([-1, totalBobTime + 2])
+      .range([height, 0]);
+
+    // Calculate Current Coordinate Time (Bob's time)
+    let currentTime = 0;
+    if (step === SimulationStep.SETUP) currentTime = 0;
+    else if (step === SimulationStep.OUTBOUND) currentTime = bobTimeOneWay * progress;
+    else if (step === SimulationStep.TURNAROUND) currentTime = bobTimeOneWay;
+    else if (step === SimulationStep.INBOUND) currentTime = bobTimeOneWay + (bobTimeOneWay * progress);
+    else if (step === SimulationStep.CONCLUSION) currentTime = totalBobTime;
+
+    // --- Signal Visualization ---
+    let bobSignalsReceived = 0;
+    let aliceSignalsReceived = 0;
+
+    // Bob's birthday signals to Alice
+    // Bob emits at coordinate time t = 1, 2, 3, ... (his proper time = coordinate time since he's at rest)
+    // Each signal travels rightward at c: x = t - t_emit
+    if (showBobSignals) {
+      const maxEmit = Math.floor(totalBobTime);
+      for (let n = 1; n <= maxEmit; n++) {
+        if (n > currentTime) break; // Not yet emitted
+
+        // Find intersection with Alice's worldline
+        // Outbound leg: Alice at x = v*t for 0 <= t <= bobTimeOneWay
+        //   v*t = t - n  =>  t = n/(1-v)
+        let tInt = n / (1 - v);
+        let xInt = v * tInt;
+        let hitOutbound = tInt <= bobTimeOneWay && tInt >= 0;
+
+        if (!hitOutbound) {
+          // Inbound leg: Alice at x = dist - v*(t - bobTimeOneWay) for bobTimeOneWay <= t <= totalBobTime
+          //   dist - v*(t - bobTimeOneWay) = t - n
+          //   t*(1+v) = dist + v*bobTimeOneWay + n
+          tInt = (dist + v * bobTimeOneWay + n) / (1 + v);
+          xInt = tInt - n;
+        }
+
+        const received = currentTime >= tInt;
+        const endX = received ? xInt : (currentTime - n);
+        const endT = received ? tInt : currentTime;
+
+        if (received) bobSignalsReceived++;
+
+        // Draw signal line
+        g.append("line")
+          .attr("x1", xScale(0)).attr("y1", yScale(n))
+          .attr("x2", xScale(Math.max(endX, 0))).attr("y2", yScale(endT))
+          .attr("stroke", "#60a5fa")
+          .attr("stroke-width", 1)
+          .attr("stroke-dasharray", "3,3")
+          .attr("opacity", 0.7);
+
+        // Emission dot on Bob's worldline
+        g.append("circle")
+          .attr("cx", xScale(0)).attr("cy", yScale(n))
+          .attr("r", 2).attr("fill", "#60a5fa");
+
+        // Reception dot
+        if (received) {
+          g.append("circle")
+            .attr("cx", xScale(xInt)).attr("cy", yScale(tInt))
+            .attr("r", 3).attr("fill", "#60a5fa").attr("stroke", "#1e3a8a").attr("stroke-width", 1);
+        }
+      }
+    }
+
+    // Alice's birthday signals to Bob
+    // Alice emits at her proper time tau = 1, 2, 3, ...
+    // Convert proper time to coordinate (t, x) then signal travels leftward at c towards x=0
+    if (showAliceSignals) {
+      const totalAliceProperTime = aliceTimeOneWay * 2;
+      const maxEmitTau = Math.floor(totalAliceProperTime);
+
+      for (let tau = 1; tau <= maxEmitTau; tau++) {
+        let emitT: number, emitX: number;
+
+        if (tau <= aliceTimeOneWay) {
+          // Outbound leg
+          emitT = tau * gamma;
+          emitX = v * emitT;
+        } else {
+          // Inbound leg
+          const deltaTau = tau - aliceTimeOneWay;
+          emitT = bobTimeOneWay + deltaTau * gamma;
+          emitX = dist - v * (emitT - bobTimeOneWay);
+        }
+
+        if (emitT > currentTime) continue; // Not yet emitted
+
+        // Signal travels leftward at c: x = emitX - (t - emitT)
+        // Arrives at Bob (x=0) when: 0 = emitX - (tArrive - emitT) => tArrive = emitT + emitX
+        const tArrive = emitT + emitX;
+        const received = currentTime >= tArrive;
+
+        let endX: number, endT: number;
+        if (received) {
+          endX = 0;
+          endT = tArrive;
+          aliceSignalsReceived++;
+        } else {
+          endT = currentTime;
+          endX = emitX - (currentTime - emitT);
+        }
+
+        // Draw signal line
+        g.append("line")
+          .attr("x1", xScale(emitX)).attr("y1", yScale(emitT))
+          .attr("x2", xScale(Math.max(endX, 0))).attr("y2", yScale(endT))
+          .attr("stroke", "#f87171")
+          .attr("stroke-width", 1)
+          .attr("stroke-dasharray", "3,3")
+          .attr("opacity", 0.7);
+
+        // Emission dot on Alice's worldline
+        g.append("circle")
+          .attr("cx", xScale(emitX)).attr("cy", yScale(emitT))
+          .attr("r", 2).attr("fill", "#f87171");
+
+        // Reception dot on Bob's worldline
+        if (received) {
+          g.append("circle")
+            .attr("cx", xScale(0)).attr("cy", yScale(tArrive))
+            .attr("r", 3).attr("fill", "#f87171").attr("stroke", "#7f1d1d").attr("stroke-width", 1);
+        }
+      }
+    }
+
+    // Update signal counts (deferred to avoid render loop)
+    if (counts.bobReceivedByAlice !== bobSignalsReceived || counts.aliceReceivedByBob !== aliceSignalsReceived) {
+      setTimeout(() => setCounts({ bobReceivedByAlice: bobSignalsReceived, aliceReceivedByBob: aliceSignalsReceived }), 0);
+    }
+
+    // Grid Helpers
+    const drawSkewedGrid = (velocity: number, origin: {x: number, t: number}, color: string, opacity: number) => {
+        const gammaFactor = 1 / Math.sqrt(1 - velocity * velocity);
+        
+        // Inverse transform: find min/max x' and t' visible in the viewport
+        const inverseTransform = (x: number, t: number) => {
+            const dx = x - origin.x;
+            const dt = t - origin.t;
+            return {
+                xp: gammaFactor * (dx - velocity * dt),
+                tp: gammaFactor * (dt - velocity * dx)
+            };
+        };
+
+        const xDom = xScale.domain();
+        const yDom = yScale.domain();
+        
+        // Check 4 corners of the visible graph area
+        const corners = [
+            inverseTransform(xDom[0], yDom[0]),
+            inverseTransform(xDom[1], yDom[0]),
+            inverseTransform(xDom[1], yDom[1]),
+            inverseTransform(xDom[0], yDom[1])
+        ];
+
+        const minTp = Math.min(...corners.map(c => c.tp));
+        const maxTp = Math.max(...corners.map(c => c.tp));
+
+        // Use Math.ceil and Math.floor to ensure we only iterate integers within the range
+        const startTp = Math.ceil(minTp);
+        const endTp = Math.floor(maxTp);
+
+        const gridG = g.append("g")
+            .attr("class", "alice-grid")
+            .style("opacity", opacity)
+            .attr("clip-path", "url(#chart-clip)");
+
+        // Transform (x', t') back to (x, t) for labels
+        const transform = (xp: number, tp: number) => ({
+            x: origin.x + gammaFactor * (xp + velocity * tp),
+            t: origin.t + gammaFactor * (tp + velocity * xp)
+        });
+
+        // 1. Draw Constant t' lines (Alice's lines of simultaneity)
+        // t = origin.t + v*(x - origin.x) + tp/gamma
+        for (let tp = startTp; tp <= endTp; tp += 1) {
+            // We calculate the line across the full visible width
+            const x1 = xDom[0];
+            const x2 = xDom[1];
+            
+            const t1 = origin.t + velocity * (x1 - origin.x) + tp / gammaFactor;
+            const t2 = origin.t + velocity * (x2 - origin.x) + tp / gammaFactor;
+
+            gridG.append("line")
+                .attr("x1", xScale(x1))
+                .attr("y1", yScale(t1))
+                .attr("x2", xScale(x2))
+                .attr("y2", yScale(t2))
+                .attr("stroke", color)
+                .attr("stroke-width", 0.5)
+                .attr("stroke-dasharray", "4,4");
+
+            // Add label near x=0 (Alice's path) if visible, or clamp to edge
+            const labelPos = transform(0, tp);
+            // Basic label placement
+            if (labelPos.x >= xDom[0] && labelPos.x <= xDom[1] && labelPos.t >= yDom[0] && labelPos.t <= yDom[1]) {
+                 gridG.append("text")
+                    .attr("x", xScale(labelPos.x) + 4)
+                    .attr("y", yScale(labelPos.t) - 2)
+                    .attr("fill", color)
+                    .attr("font-size", "9px")
+                    .attr("font-weight", "bold")
+                    .text(`t'=${tp}`);
+            }
+        }
+    };
+
+    // 0. Draw Alice's Grid if enabled
+    if (showAliceGrid) {
+        if (step === SimulationStep.SETUP || step === SimulationStep.OUTBOUND) {
+            drawSkewedGrid(v, {x:0, t:0}, "#22d3ee", 0.5); // Cyan
+        } else if (step === SimulationStep.INBOUND || step === SimulationStep.CONCLUSION) {
+            drawSkewedGrid(-v, {x: dist, t: bobTimeOneWay}, "#a78bfa", 0.5); // Violet
+        } else if (step === SimulationStep.TURNAROUND) {
+            // Show both during turnaround to emphasize the shift
+            drawSkewedGrid(v, {x:0, t:0}, "#22d3ee", 0.3); 
+            drawSkewedGrid(-v, {x: dist, t: bobTimeOneWay}, "#a78bfa", 0.3);
+        }
+    }
+
+    // 1. Grid & Axes
+    const xAxis = d3.axisBottom(xScale);
+    const yAxis = d3.axisLeft(yScale);
+
+    // Standard Grid lines (Bob)
+    g.append("g")
+      .attr("class", "grid opacity-10")
+      .call(d3.axisBottom(xScale).tickSize(-height).tickFormat(() => ""))
+      .attr("transform", `translate(0,${height})`);
+    
+    g.append("g")
+      .attr("class", "grid opacity-10")
+      .call(d3.axisLeft(yScale).tickSize(-width).tickFormat(() => ""));
+
+    // Draw Axes
+    g.append("g")
+      .attr("transform", `translate(0,${height})`)
+      .call(xAxis)
+      .attr("color", "#94a3b8")
+      .append("text")
+      .attr("x", width)
+      .attr("y", -10)
+      .attr("fill", "#94a3b8")
+      .text("Position (ly)");
+
+    g.append("g")
+      .call(yAxis)
+      .attr("color", "#94a3b8")
+      .append("text")
+      .attr("transform", "rotate(-90)")
+      .attr("y", 20)
+      .attr("fill", "#94a3b8")
+      .text("Time (years)");
+
+    // 2. Light Cones (45 degrees)
+    const drawLightCone = (tx: number, ty: number) => {
+      const size = 10;
+      g.append("line")
+        .attr("x1", xScale(tx))
+        .attr("y1", yScale(ty))
+        .attr("x2", xScale(tx + size))
+        .attr("y2", yScale(ty + size))
+        .attr("stroke", "#fbbf24") // Amber
+        .attr("stroke-dasharray", "4")
+        .attr("opacity", 0.5);
+        
+      g.append("line")
+        .attr("x1", xScale(tx))
+        .attr("y1", yScale(ty))
+        .attr("x2", xScale(tx - size))
+        .attr("y2", yScale(ty + size))
+        .attr("stroke", "#fbbf24")
+        .attr("stroke-dasharray", "4")
+        .attr("opacity", 0.5);
+        
+      // Label for Light
+      g.append("text")
+        .attr("x", xScale(tx + 2))
+        .attr("y", yScale(ty + 2) - 5)
+        .attr("fill", "#fbbf24")
+        .attr("transform", `rotate(-45, ${xScale(tx+2)}, ${yScale(ty+2)})`)
+        .attr("font-size", "10px")
+        .attr("opacity", 0.8)
+        .text("Light Speed (c)");
+    };
+    drawLightCone(0, 0);
+
+    // 3. Bob's World Line (Earth)
+    g.append("line")
+      .attr("x1", xScale(0))
+      .attr("y1", yScale(0))
+      .attr("x2", xScale(0))
+      .attr("y2", yScale(totalBobTime))
+      .attr("stroke", "#3b82f6") // Blue
+      .attr("stroke-width", 3);
+
+    g.append("text")
+      .attr("x", xScale(0) - 10)
+      .attr("y", yScale(totalBobTime) - 10)
+      .attr("fill", "#3b82f6")
+      .text("Bob (Earth)");
+
+    // 4. Planet Line
+    g.append("line")
+      .attr("x1", xScale(dist))
+      .attr("y1", yScale(0))
+      .attr("x2", xScale(dist))
+      .attr("y2", yScale(totalBobTime))
+      .attr("stroke", "#94a3b8")
+      .attr("stroke-dasharray", "2")
+      .attr("opacity", 0.5);
+
+    g.append("text")
+      .attr("x", xScale(dist))
+      .attr("y", yScale(-0.5))
+      .attr("fill", "#94a3b8")
+      .text("Planet");
+
+    // 5. Alice's World Line Calculation
+    const outboundEnd = { x: dist, t: bobTimeOneWay };
+    const inboundEnd = { x: 0, t: totalBobTime };
+
+    // Draw full path ghost
+    g.append("path")
+      .datum([{x:0, t:0}, outboundEnd, inboundEnd])
+      .attr("fill", "none")
+      .attr("stroke", "#ef4444") // Red
+      .attr("stroke-width", 1)
+      .attr("opacity", 0.3)
+      .attr("d", d3.line<{x:number, t:number}>()
+        .x(d => xScale(d.x))
+        .y(d => yScale(d.t))
+      );
+
+    // 6. Dynamic Rendering based on Step
+    let currentAlicePos = { x: 0, t: 0 };
+    let showSimultaneity = false;
+    let simultaneitySlope = 0; // Slope in t vs x: slope = v
+
+    if (step === SimulationStep.SETUP) {
+      currentAlicePos = { x: 0, t: 0 };
+    } 
+    else if (step === SimulationStep.OUTBOUND) {
+      currentAlicePos = {
+        x: dist * progress,
+        t: bobTimeOneWay * progress
+      };
+      showSimultaneity = true;
+      simultaneitySlope = v; // In x-ct units, slope is v
+    } 
+    else if (step === SimulationStep.TURNAROUND) {
+      currentAlicePos = outboundEnd;
+      // Show sweep
+      showSimultaneity = true;
+      // Interpolate slope from v to -v
+      // Outbound slope: v
+      // Inbound slope: -v
+      const slopeStart = v;
+      const slopeEnd = -v;
+      simultaneitySlope = slopeStart + (slopeEnd - slopeStart) * progress;
+    } 
+    else if (step === SimulationStep.INBOUND) {
+      currentAlicePos = {
+        x: dist * (1 - progress),
+        t: bobTimeOneWay + (bobTimeOneWay * progress)
+      };
+      showSimultaneity = true;
+      simultaneitySlope = -v;
+    } 
+    else if (step === SimulationStep.CONCLUSION) {
+      currentAlicePos = inboundEnd;
+      showSimultaneity = false;
+    }
+
+    // Draw Alice's active path
+    const pathData = [{x:0, t:0}];
+    if (step === SimulationStep.OUTBOUND) {
+      pathData.push(currentAlicePos);
+    } else if (step === SimulationStep.TURNAROUND || step === SimulationStep.INBOUND || step === SimulationStep.CONCLUSION) {
+      pathData.push(outboundEnd);
+      if (step !== SimulationStep.TURNAROUND) {
+        pathData.push(currentAlicePos);
+      }
+    }
+
+    g.append("path")
+      .datum(pathData)
+      .attr("fill", "none")
+      .attr("stroke", "#ef4444")
+      .attr("stroke-width", 3)
+      .attr("d", d3.line<{x:number, t:number}>()
+        .x(d => xScale(d.x))
+        .y(d => yScale(d.t))
+      );
+
+    // Draw Alice Dot
+    g.append("circle")
+      .attr("cx", xScale(currentAlicePos.x))
+      .attr("cy", yScale(currentAlicePos.t))
+      .attr("r", 6)
+      .attr("fill", "#ef4444");
+
+    // Draw Line of Simultaneity (Alice's "Now")
+    if (showSimultaneity) {
+      // Equation: t - t_alice = slope * (x - x_alice)
+      // t_bob_intercept = t_alice - slope * x_alice
+      const t_bob_intercept = currentAlicePos.t - simultaneitySlope * currentAlicePos.x;
+      
+      // Draw line from Alice to Bob's axis (and slightly beyond)
+      g.append("line")
+        .attr("x1", xScale(currentAlicePos.x))
+        .attr("y1", yScale(currentAlicePos.t))
+        .attr("x2", xScale(-0.5)) // Go a bit past Bob
+        .attr("y2", yScale(currentAlicePos.t - simultaneitySlope * (currentAlicePos.x - (-0.5))))
+        .attr("stroke", "#10b981") // Emerald
+        .attr("stroke-width", 2)
+        .attr("stroke-dasharray", "5,5");
+
+      // Mark the intercept on Bob's line
+      g.append("circle")
+        .attr("cx", xScale(0))
+        .attr("cy", yScale(t_bob_intercept))
+        .attr("r", 4)
+        .attr("fill", "#10b981");
+        
+      g.append("text")
+        .attr("x", xScale(0) - 90)
+        .attr("y", yScale(t_bob_intercept) + 5)
+        .attr("fill", "#10b981")
+        .attr("font-size", "12px")
+        .text(`Bob's Age: ${t_bob_intercept.toFixed(2)}y`);
+      
+      g.append("text")
+        .attr("x", xScale(currentAlicePos.x) + 10)
+        .attr("y", yScale(currentAlicePos.t) - 10)
+        .attr("fill", "#ef4444")
+        .attr("font-size", "12px")
+        .text(`Alice Age: ${calculateAliceAge(step, progress, aliceTimeOneWay).toFixed(2)}y`);
+    }
+
+  }, [dimensions, params, step, progress, showAliceGrid, showBobSignals, showAliceSignals]);
+
+  const calculateAliceAge = (s: SimulationStep, p: number, oneWay: number) => {
+    switch(s) {
+      case SimulationStep.SETUP: return 0;
+      case SimulationStep.OUTBOUND: return oneWay * p;
+      case SimulationStep.TURNAROUND: return oneWay;
+      case SimulationStep.INBOUND: return oneWay + (oneWay * p);
+      case SimulationStep.CONCLUSION: return oneWay * 2;
+      default: return 0;
+    }
+  };
+
+  return (
+    <div ref={containerRef} className="w-full h-full min-h-[400px] bg-slate-900 rounded-xl border border-slate-700 shadow-xl overflow-hidden relative">
+        <div className="absolute top-4 right-4 bg-slate-800/80 p-2 rounded text-xs text-slate-300 pointer-events-none z-10 text-right">
+            <div className="font-bold mb-1">Space-Time Diagram</div>
+            {(showBobSignals || showAliceSignals) && (
+                <div className="mt-2 space-y-1 bg-slate-900/90 p-2 rounded border border-slate-700">
+                    {showBobSignals && (
+                        <div className="text-blue-400">
+                             Alice received: <span className="font-mono font-bold text-white">{counts.bobReceivedByAlice}</span> msgs
+                        </div>
+                    )}
+                    {showAliceSignals && (
+                        <div className="text-red-400">
+                             Bob received: <span className="font-mono font-bold text-white">{counts.aliceReceivedByBob}</span> msgs
+                        </div>
+                    )}
+                </div>
+            )}
+        </div>
+        <svg ref={svgRef} width={dimensions.width} height={dimensions.height} className="block" />
+    </div>
+  );
+};
+
+export default MinkowskiDiagram;
